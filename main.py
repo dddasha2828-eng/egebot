@@ -7,6 +7,8 @@ import asyncio
 import html
 import logging
 import os
+import secrets
+from calendar import monthrange
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -14,7 +16,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -45,6 +47,8 @@ TZ = ZoneInfo("Europe/Moscow")
 TEACHER_FULL = os.getenv("TEACHER_FULL", f"ИП {TEACHER}")          # оператор данных для политики
 PRIVACY_URL = os.getenv("PRIVACY_URL", "")                          # ссылка на политику, если есть на сайте
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "")                    # прокси для связи с Телеграмом
+TEACHER_CONTACT = os.getenv("TEACHER_CONTACT", "")                  # @юзернейм Анастасии для продления
+WARN_DAYS = int(os.getenv("WARN_DAYS", "3"))                        # за сколько дней предупреждать о конце доступа
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -55,13 +59,15 @@ BTN_ADD = "➕ Добавить урок"
 BTN_LESSONS = "📚 Уроки"
 BTN_STUDENTS = "👥 Ученики"
 BTN_AS_STUDENT = "👀 Как видит ученик"
-MENU_BUTTONS = {BTN_MY, BTN_ADD, BTN_LESSONS, BTN_STUDENTS, BTN_AS_STUDENT}
+BTN_INVITE = "🔗 Пригласить ученика"
+MENU_BUTTONS = {BTN_MY, BTN_ADD, BTN_LESSONS, BTN_STUDENTS, BTN_AS_STUDENT, BTN_INVITE}
 
 STUDENT_KB = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_MY)]], resize_keyboard=True)
 ADMIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_LESSONS)],
-        [KeyboardButton(text=BTN_STUDENTS), KeyboardButton(text=BTN_AS_STUDENT)],
+        [KeyboardButton(text=BTN_STUDENTS), KeyboardButton(text=BTN_INVITE)],
+        [KeyboardButton(text=BTN_AS_STUDENT)],
     ],
     resize_keyboard=True,
 )
@@ -164,6 +170,41 @@ async def send_cover(bot, chat_id, cache_key, make, caption, markup=None, lesson
     return msg
 
 
+# ================== ОПЛАЧЕНО ДО ==================
+def add_months(ts: int, months: int) -> int:
+    d = datetime.fromtimestamp(ts, TZ)
+    m = d.month - 1 + months
+    y, m = d.year + m // 12, m % 12 + 1
+    day = min(d.day, monthrange(y, m)[1])
+    return int(d.replace(year=y, month=m, day=day, hour=23, minute=59, second=0).timestamp())
+
+
+def extend_access(uid: int, months: int):
+    """months=0: без срока. Иначе продлеваем от текущей даты окончания (или от сегодня)."""
+    u = db.get_user(uid)
+    if months == 0:
+        until = None
+    else:
+        base = u["paid_until"] if u["paid_until"] and u["paid_until"] > db.now() else db.now()
+        until = add_months(base, months)
+    db.update_user(uid, status="active", paid_until=until, warned=0,
+                   approved_at=u["approved_at"] or db.now())
+    return until
+
+
+def until_txt(u):
+    return f"до {fmt(u['paid_until'], False)}" if u["paid_until"] else "без срока"
+
+
+def contact_line():
+    return f"напиши {TEACHER_OF}: {TEACHER_CONTACT}" if TEACHER_CONTACT else f"напиши {TEACHER_OF}"
+
+
+def access_buttons(uid, prefix="ap"):
+    return [[("✅ На 1 месяц", f"{prefix}:{uid}:1"), ("✅ На 3 месяца", f"{prefix}:{uid}:3")],
+            [("♾ Без срока", f"{prefix}:{uid}:0")]]
+
+
 # ================== УРОКИ ДЛЯ УЧЕНИКА ==================
 async def send_finish(bot, uid):
     await send_cover(
@@ -256,10 +297,16 @@ async def send_welcome(bot: Bot, uid: int, first_name: str):
 
 # ================== СТАРТ ==================
 @router.message(CommandStart())
-async def start(msg: Message, state: FSMContext, bot: Bot):
+async def start(msg: Message, state: FSMContext, bot: Bot, command: CommandObject):
     await state.clear()
     uid, name, username = msg.from_user.id, msg.from_user.full_name, msg.from_user.username
     u = db.get_user(uid)
+    code = (command.args or "")[4:] if (command.args or "").startswith("inv_") else None
+    if code:
+        await state.update_data(invite=code)
+    if code and u and not u["is_admin"]:
+        db.touch(uid, name, username)
+        return await use_invite(bot, uid, code, msg.from_user.first_name, state)
 
     if not u:
         if not db.has_admins():
@@ -276,7 +323,7 @@ async def start(msg: Message, state: FSMContext, bot: Bot):
     if u["status"] == "pending":
         return await msg.answer(f"Твоя заявка уже у {TEACHER_OF} 🌿 Как только доступ откроется, я пришлю первый урок.")
     if u["status"] == "blocked":
-        return await msg.answer(f"Доступ к урокам сейчас закрыт. Если это ошибка, напиши {TEACHER_OF}.")
+        return await msg.answer(f"Доступ к урокам сейчас закрыт. Чтобы открыть его, {contact_line()} 🌿")
     await msg.answer("С возвращением! Продолжаем с того места, где ты остановился 👇", reply_markup=STUDENT_KB)
     await send_lesson(bot, uid, u["current_idx"])
 
@@ -329,7 +376,7 @@ async def privacy_cmd(msg: Message):
 
 
 @router.callback_query(F.data == "agree")
-async def agree(cb: CallbackQuery, bot: Bot):
+async def agree(cb: CallbackQuery, bot: Bot, state: FSMContext):
     fu = cb.from_user
     await cb.answer("Спасибо! 🌿")
     try:
@@ -339,8 +386,11 @@ async def agree(cb: CallbackQuery, bot: Bot):
     if db.get_user(fu.id):
         return
     uid = fu.id
+    code = (await state.get_data()).get("invite")
     db.add_user(uid, fu.full_name, fu.username, "active" if AUTO_ACCESS else "pending")
     db.update_user(uid, consent_at=db.now())
+    if code:
+        return await use_invite(bot, uid, code, fu.first_name, state, new=True)
     u = db.get_user(uid)
     if u["status"] == "pending":
         await bot.send_message(
@@ -351,14 +401,87 @@ async def agree(cb: CallbackQuery, bot: Bot):
         for a in db.admins():
             try:
                 await bot.send_message(
-                    a, f"🙋 <b>Новая заявка в клуб</b>\n\n{display_name(u)}",
-                    reply_markup=kb([("✅ Открыть доступ", f"ap:{uid}"), ("✖️ Отклонить", f"rj:{uid}")]),
+                    a, f"🙋 <b>Новая заявка в клуб</b>\n\n{display_name(u)}\n\nНа сколько открыть доступ?",
+                    reply_markup=kb(*access_buttons(uid), [("✖️ Отклонить", f"rj:{uid}")]),
                 )
             except Exception:
                 pass
         return
     await send_welcome(bot, uid, fu.first_name)
     await send_lesson(bot, uid, 1)
+
+
+# ================== ПРИГЛАШЕНИЯ ==================
+async def use_invite(bot: Bot, uid: int, code: str, first_name: str, state: FSMContext, new=False):
+    await state.clear()
+    inv = db.invite(code)
+    u = db.get_user(uid)
+    if not inv or (inv["used_by"] and inv["used_by"] != uid):
+        await bot.send_message(uid, "Эта ссылка уже использована или устарела 🙈")
+        if u["status"] == "pending" and new:
+            for a in db.admins():
+                try:
+                    await bot.send_message(
+                        a, f"🙋 <b>Новая заявка в клуб</b>\n\n{display_name(u)}\n(пришёл по старой ссылке)",
+                        reply_markup=kb(*access_buttons(uid), [("✖️ Отклонить", f"rj:{uid}")]),
+                    )
+                except Exception:
+                    pass
+            await bot.send_message(uid, f"Я передала твою заявку {TEACHER_OF} 🌿")
+        return
+    if inv["used_by"] == uid:
+        return await start_or_continue(bot, uid, first_name)
+    was = u["status"]
+    db.use_invite(code, uid)
+    until = extend_access(uid, inv["months"])
+    for a in db.admins():
+        try:
+            await bot.send_message(
+                a, f"🎉 {display_name(db.get_user(uid))} вошёл в клуб по ссылке. Доступ {until_txt(db.get_user(uid))}",
+            )
+        except Exception:
+            pass
+    if new or was == "pending":
+        await send_welcome(bot, uid, first_name)
+        return await send_lesson(bot, uid, 1)
+    await bot.send_message(uid, f"🔓 Доступ открыт {until_txt(db.get_user(uid))}! Продолжаем 👇", reply_markup=STUDENT_KB)
+    await send_lesson(bot, uid, db.get_user(uid)["current_idx"])
+
+
+async def start_or_continue(bot, uid, first_name):
+    u = db.get_user(uid)
+    await bot.send_message(uid, "Продолжаем с того места, где ты остановился 👇", reply_markup=STUDENT_KB)
+    await send_lesson(bot, uid, u["current_idx"])
+
+
+@router.message(F.text == BTN_INVITE)
+async def invite_start(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    await state.clear()
+    await msg.answer(
+        "<b>🔗 Пригласить ученика</b>\n\nНа сколько оплачен доступ? Я сделаю одноразовую ссылку, "
+        "ученик перейдёт по ней и сразу попадёт в клуб.",
+        reply_markup=kb([("1 месяц", "inv:1"), ("3 месяца", "inv:3")], [("Без срока", "inv:0")]),
+    )
+
+
+@router.callback_query(F.data.startswith("inv:"))
+async def invite_make(cb: CallbackQuery, bot: Bot):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer()
+    months = int(cb.data.split(":")[1])
+    code = secrets.token_urlsafe(9).replace("-", "a").replace("_", "b")
+    db.create_invite(code, cb.from_user.id, months)
+    me = await bot.get_me()
+    period = {0: "без срока", 1: "на 1 месяц", 3: "на 3 месяца"}.get(months, f"на {months} мес.")
+    await cb.answer()
+    await cb.message.edit_text(
+        f"✅ <b>Ссылка готова</b> (доступ {period})\n\n"
+        f"<code>https://t.me/{me.username}?start=inv_{code}</code>\n\n"
+        "Нажми на ссылку, чтобы скопировать, и отправь ученику. Сработает один раз. "
+        "Когда ученик войдёт, я пришлю уведомление 🌿",
+    )
 
 
 @router.message(Command("myid"))
@@ -859,7 +982,8 @@ async def students_list(msg: Message, state: FSMContext):
     for u in st[:80]:
         icon = {"active": "🟢", "pending": "🙋", "blocked": "🔒"}[u["status"]]
         done = db.submitted_lessons_count(u["id"])
-        rows.append([(f"{icon} {(u['name'] or 'Без имени')[:22]}  ·  ДЗ {done}/{total}", f"st:{u['id']}")])
+        exp = f"  ·  до {fmt(u['paid_until'], False)[:5]}" if u["status"] == "active" and u["paid_until"] else ""
+        rows.append([(f"{icon} {(u['name'] or 'Без имени')[:20]}  ·  ДЗ {done}/{total}{exp}", f"st:{u['id']}")])
     act = len([u for u in st if u["status"] == "active"])
     pen = len([u for u in st if u["status"] == "pending"])
     await msg.answer(
@@ -878,6 +1002,7 @@ def student_card(uid):
     text = (
         f"<b>{display_name(u)}</b>\n\n"
         f"Статус: {STATUS_TXT[u['status']]}\n"
+        f"Оплачено: {until_txt(u) if u['status'] == 'active' else ('было ' + until_txt(u) if u['paid_until'] else 'нет')}\n"
         f"В клубе с: {fmt(u['approved_at'] or u['created_at'], False)}\n"
         f"Сейчас на уроке: {min(u['current_idx'], total) if total else 0} из {total}\n"
         f"Сдано домашек: {db.submitted_lessons_count(uid)} из {total}\n"
@@ -888,11 +1013,13 @@ def student_card(uid):
     if subs:
         rows.append([("📂 Посмотреть домашки", f"subs:{uid}")])
     if u["status"] == "pending":
-        rows.append([("✅ Открыть доступ", f"ap:{uid}"), ("✖️ Отклонить", f"rj:{uid}")])
+        rows += access_buttons(uid)
+        rows.append([("✖️ Отклонить", f"rj:{uid}")])
     elif u["status"] == "active":
+        rows.append([("➕ 1 месяц", f"ap:{uid}:1"), ("➕ 3 месяца", f"ap:{uid}:3"), ("♾ Без срока", f"ap:{uid}:0")])
         rows.append([("🔒 Закрыть доступ", f"blk:{uid}")])
     else:
-        rows.append([("🔓 Открыть доступ", f"ap:{uid}")])
+        rows.append([("🔓 На 1 месяц", f"ap:{uid}:1"), ("🔓 На 3 месяца", f"ap:{uid}:3"), ("♾ Без срока", f"ap:{uid}:0")])
     rows.append([("👑 Сделать админом", f"mkadm:{uid}"), ("🗑 Удалить данные", f"udel:{uid}")])
     return text, kb(*rows)
 
@@ -910,20 +1037,31 @@ async def student_open(cb: CallbackQuery):
 async def approve(cb: CallbackQuery, bot: Bot):
     if not is_admin(cb.from_user.id):
         return await cb.answer()
-    uid = int(cb.data.split(":")[1])
+    parts = cb.data.split(":")
+    uid = int(parts[1])
     u = db.get_user(uid)
+    if not u:
+        return await cb.answer("Ученик не найден", show_alert=True)
+    if len(parts) < 3:
+        await cb.answer()
+        return await cb.message.answer(
+            f"На сколько открыть доступ для {display_name(u)}?", reply_markup=kb(*access_buttons(uid))
+        )
     was = u["status"]
-    db.update_user(uid, status="active", approved_at=u["approved_at"] or db.now())
-    await cb.answer("Доступ открыт ✅")
+    extend_access(uid, int(parts[2]))
+    u = db.get_user(uid)
+    await cb.answer(f"Доступ открыт {until_txt(u)} ✅")
     text, markup = student_card(uid)
     await cb.message.edit_text(text, reply_markup=markup)
     try:
         if was == "pending":
             first = (u["name"] or "").split(" ")[0] or "друг"
             await send_welcome(bot, uid, first)
+        elif was == "blocked":
+            await bot.send_message(uid, f"🔓 Доступ открыт {until_txt(u)}! Продолжаем 👇", reply_markup=STUDENT_KB)
         else:
-            await bot.send_message(uid, "🔓 Доступ к урокам снова открыт! Продолжаем 👇", reply_markup=STUDENT_KB)
-        await send_lesson(bot, uid, db.get_user(uid)["current_idx"])
+            return await bot.send_message(uid, f"✅ Доступ продлён {until_txt(u)}. Спасибо! 🌿")
+        await send_lesson(bot, uid, u["current_idx"])
     except Exception:
         pass
 
@@ -1068,6 +1206,60 @@ async def reminders(bot: Bot):
             logging.exception("reminders: %s", e)
 
 
+async def access_watch(bot: Bot):
+    """Предупреждаем о конце оплаченного периода и закрываем доступ, когда он истёк."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            now = db.now()
+            for u in db.q(
+                "SELECT * FROM users WHERE status='active' AND is_admin=0 AND paid_until IS NOT NULL AND paid_until<?",
+                (now,),
+            ):
+                db.update_user(u["id"], status="blocked")
+                try:
+                    await bot.send_message(
+                        u["id"],
+                        f"⏳ Оплаченный период закончился, доступ к урокам на паузе.\n\n"
+                        f"Чтобы продлить, {contact_line()}. Весь твой прогресс сохранён 🌿",
+                    )
+                except Exception:
+                    pass
+                for a in db.admins():
+                    try:
+                        await bot.send_message(
+                            a, f"🔒 У {display_name(u)} закончился доступ. Продлить?",
+                            reply_markup=kb([("➕ 1 месяц", f"ap:{u['id']}:1"), ("➕ 3 месяца", f"ap:{u['id']}:3")]),
+                        )
+                    except Exception:
+                        pass
+            for u in db.q(
+                "SELECT * FROM users WHERE status='active' AND is_admin=0 AND paid_until IS NOT NULL "
+                "AND warned=0 AND paid_until<?",
+                (now + WARN_DAYS * 86400,),
+            ):
+                db.update_user(u["id"], warned=1)
+                try:
+                    await bot.send_message(
+                        u["id"],
+                        f"🌿 Напоминаю: доступ к клубу оплачен до {fmt(u['paid_until'], False)}.\n\n"
+                        f"Чтобы продолжить без перерыва, {contact_line()}.",
+                    )
+                except Exception:
+                    pass
+                for a in db.admins():
+                    try:
+                        await bot.send_message(
+                            a, f"⏳ У {display_name(u)} доступ заканчивается {fmt(u['paid_until'], False)}",
+                            reply_markup=kb([("➕ 1 месяц", f"ap:{u['id']}:1"), ("➕ 3 месяца", f"ap:{u['id']}:3")]),
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.exception("access_watch: %s", e)
+        await asyncio.sleep(1800)
+
+
 # ================== ДЕМО УРОКИ ==================
 DEMO = [
     ("Задание 1. Планиметрия: треугольники и углы",
@@ -1103,6 +1295,7 @@ async def main():
     dp.include_router(router)
     await bot.set_my_commands([BotCommand(command="start", description="Начать / продолжить")])
     asyncio.create_task(reminders(bot))
+    asyncio.create_task(access_watch(bot))
     logging.info("Бот запущен")
     await dp.start_polling(bot)
 

@@ -52,8 +52,13 @@ def init():
         """
     )
     cols = [r["name"] for r in _conn.execute("PRAGMA table_info(users)")]
-    if "consent_at" not in cols:
-        _conn.execute("ALTER TABLE users ADD COLUMN consent_at INTEGER")
+    for col in ("consent_at", "paid_until", "warned"):
+        if col not in cols:
+            _conn.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER" + (" DEFAULT 0" if col == "warned" else ""))
+    _conn.execute(
+        "CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, created_by INTEGER, months INTEGER, "
+        "created_at INTEGER, used_by INTEGER, used_at INTEGER)"
+    )
     _conn.commit()
 
 
@@ -201,3 +206,16 @@ def submission_items(sid):
 
 def submitted_lessons_count(uid):
     return q1("SELECT COUNT(DISTINCT lesson_id) c FROM submissions WHERE user_id=?", (uid,))["c"]
+
+
+# ---------- приглашения ----------
+def create_invite(code, admin_id, months):
+    run("INSERT INTO invites(code,created_by,months,created_at) VALUES(?,?,?,?)", (code, admin_id, months, now()))
+
+
+def invite(code):
+    return q1("SELECT * FROM invites WHERE code=?", (code,))
+
+
+def use_invite(code, uid):
+    run("UPDATE invites SET used_by=?, used_at=? WHERE code=? AND used_by IS NULL", (uid, now(), code))
